@@ -6,15 +6,19 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellType;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.ss.usermodel.WorkbookFactory;
+import org.openlca.ilcd.commons.LangString;
 import org.openlca.ilcd.epd.EpdIndicatorResult;
 import org.openlca.ilcd.epd.EpdProfile;
 import org.openlca.ilcd.epd.EpdProfileIndicator;
@@ -26,6 +30,7 @@ import org.openlca.ilcd.processes.epd.EpdValue;
 import org.openlca.ilcd.util.Epds;
 import org.slf4j.LoggerFactory;
 
+import app.App;
 import epd.util.Strings;
 
 public class ExcelImport implements Runnable {
@@ -47,9 +52,13 @@ public class ExcelImport implements Runnable {
 	@Override
 	public void run() {
 		try (var wb = WorkbookFactory.create(file)) {
-			var sheet = wb.getSheetAt(0);
+			var sheet = findSheetOrDefault(wb, "results", true);
+			if (sheet == null)
+				return;
+
 			var slots = syncModuleEntries(sheet);
-			syncScenarios(slots);
+			syncScenarios(wb, slots);
+
 			var results = new ArrayList<EpdIndicatorResult>();
 			for (int i = 1; ; i++) {
 				var row = sheet.getRow(i);
@@ -76,20 +85,58 @@ public class ExcelImport implements Runnable {
 		}
 	}
 
-	private void syncScenarios(List<ValSlot> slots) {
-		var scenarios = new HashSet<String>();
+	private void syncScenarios(Workbook wb, List<ValSlot> slots) {
+
+		Function<String, String> keyFn =
+				s -> s != null ? s.strip().toLowerCase(Locale.US) : null;
+
+		// collect existing scenarios
+		var scenarios = new HashMap<String, EpdScenario>();
 		for (var scen : Epds.getScenarios(epd)) {
-			if (Strings.notEmpty(scen.getName())) {
-				scenarios.add(scen.getName().strip());
+			var key = keyFn.apply(scen.getName());
+			if (key != null) {
+				scenarios.put(key, scen);
 			}
 		}
-		for (var s : slots) {
-			var scenario = s.entry.getScenario();
-			if (Strings.notEmpty(scenario)
-					&& !scenarios.contains(scenario)) {
-				Epds.withScenarios(epd)
-						.add(new EpdScenario().withName(scenario));
+
+		// read scenarios from Excel sheet
+		var sheet = findSheetOrDefault(wb, "scenarios", false);
+		if (sheet != null) {
+			for (int i = 1; ; i++) {
+				var row = sheet.getRow(i);
+				if (row == null)
+					break;
+				var name = str(row.getCell(0));
+				if (Strings.nullOrEmpty(name))
+					continue;
+				var key = keyFn.apply(name);
+				if (scenarios.containsKey(key))
+					continue;
+
+				var scen = new EpdScenario()
+						.withName(name)
+						.withGroup(str(row.getCell(1)))
+						.withDefaultScenario(bool(row.getCell(3)));
+				var desc = str(row.getCell(2));
+				if (Strings.notEmpty(desc)) {
+					scen.withDescription().add(LangString.of(desc, App.lang()));
+				}
+				Epds.withScenarios(epd).add(scen);
+				scenarios.put(key, scen);
 			}
+		}
+
+		// add scenarios from module entries
+		for (var s : slots) {
+			var name = s.entry.getScenario();
+			if (Strings.nullOrEmpty(name))
+				continue;
+			var key = keyFn.apply(name);
+			if (scenarios.containsKey(key))
+				continue;
+			var scenario = new EpdScenario().withName(name);
+			Epds.withScenarios(epd).add(scenario);
+			scenarios.put(key, scenario);
 		}
 	}
 
@@ -192,6 +239,29 @@ public class ExcelImport implements Runnable {
 		return cell != null && cell.getCellType() == CellType.STRING
 				? cell.getStringCellValue()
 				: null;
+	}
+
+	private boolean bool(Cell cell) {
+		return cell != null
+				&& cell.getCellType() == CellType.BOOLEAN
+				&& cell.getBooleanCellValue();
+	}
+
+	private Sheet findSheetOrDefault(
+			Workbook wb, String label, boolean selectDefault
+	) {
+		var count = wb != null ? wb.getNumberOfSheets() : 0;
+		if (count == 0)
+			return null;
+		for (int i = 0; i < count; i++) {
+			var sheet = wb.getSheetAt(i);
+			var name = sheet.getSheetName();
+			if (Strings.nullOrEmpty(name))
+				continue;
+			if (name.strip().equalsIgnoreCase(label))
+				return sheet;
+		}
+		return selectDefault ? wb.getSheetAt(0) : null;
 	}
 
 	private record ValSlot(EpdModuleEntry entry, int col) {
